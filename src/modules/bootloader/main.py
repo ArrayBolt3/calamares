@@ -637,25 +637,47 @@ def run_grub_install(fw_type, partitions, efi_directory):
                                    "--bootloader-id=" + efi_bootloader_id,
                                    "--force"])
     else:
-        assert efi_directory is None
-        if libcalamares.globalstorage.value("bootLoader") is None:
-            return
+        try:
+            install_hybrid_grub = libcalamares.job.configuration["installHybridGRUB"]
+        except KeyError:
+            install_hybrid_grub = False
 
-        boot_loader = libcalamares.globalstorage.value("bootLoader")
-        if boot_loader["installPath"] is None:
-            return
+        if efi_directory is None:
+            if libcalamares.globalstorage.value("bootLoader") is None:
+                return
+
+            boot_loader = libcalamares.globalstorage.value("bootLoader")
+            boot_loader_install_path = boot_loader["installPath"]
+            if boot_loader_install_path is None:
+                return
+        else:
+            if not install_hybrid_grub:
+                return
+
+            # We're actually on an EFI system even though fw_type is "bios".
+            # We need to find the proper drive to install to based on which
+            # drive the ESP is located on.
+            installation_root_path = libcalamares.globalstorage.value("rootMountPoint")
+            install_efi_directory = installation_root_path + efi_directory
+            find_esp_disk_command = "echo \"/dev/$(lsblk -o PKNAME $(df --output=source" \
+                + install_efi_directory \
+                + " | tail -n1) | tail -n1)\""
+            boot_loader_install_path = subprocess.run(["sh", "-c", find_esp_disk_command],
+                capture_output=True).stdout.decode().strip()
+            if not boot_loader_install_path.startswith("/dev/"):
+                return
 
         if is_zfs:
             check_target_env_call(["sh", "-c", "ZPOOL_VDEV_NAME_PATH=1 "
                                    + libcalamares.job.configuration["grubInstall"]
                                    + " --target=i386-pc --recheck --force "
-                                   + boot_loader["installPath"]])
+                                   + boot_loader_install_path])
         else:
             check_target_env_call([libcalamares.job.configuration["grubInstall"],
                                    "--target=i386-pc",
                                    "--recheck",
                                    "--force",
-                                   boot_loader["installPath"]])
+                                   boot_loader_install_path])
 
 
 def install_grub(efi_directory, fw_type):
@@ -714,7 +736,7 @@ def install_grub(efi_directory, fw_type):
             shutil.copy2(efi_file_source, efi_file_target)
     else:
         libcalamares.utils.debug("Bootloader: grub (bios)")
-        run_grub_install(fw_type, partitions, None)
+        run_grub_install(fw_type, partitions, efi_directory)
 
     run_grub_mkconfig(partitions, libcalamares.job.configuration["grubCfg"])
 
@@ -909,8 +931,19 @@ def run():
     """
 
     fw_type = libcalamares.globalstorage.value("firmwareType")
+    boot_loader = libcalamares.globalstorage.value("bootLoader")
 
-    if libcalamares.globalstorage.value("bootLoader") is None and fw_type != "efi":
+    try:
+        install_hybrid_grub = libcalamares.job.configuration["installHybridGRUB"]
+    except KeyError:
+        install_hybrid_grub = False
+
+    try:
+        efi_boot_loader = libcalamares.job.configuration["efiBootLoader"]
+    except KeyError:
+        efi_boot_loader = ""
+
+    if boot_loader is None and fw_type != "efi":
         libcalamares.utils.warning("Non-EFI system, and no bootloader is set.")
         return None
 
@@ -923,7 +956,11 @@ def run():
             return None
 
     try:
-        prepare_bootloader(fw_type)
+        if (boot_loader == "grub" or efi_boot_loader == "grub") and install_hybrid_grub:
+            prepare_bootloader("bios")
+            prepare_bootloader("efi")
+        else:
+            prepare_bootloader(fw_type)
     except subprocess.CalledProcessError as e:
         libcalamares.utils.warning(str(e))
         libcalamares.utils.debug("stdout:" + str(e.stdout))
